@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity >=0.8.0 <0.9.0;
+pragma solidity ^0.8.19;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
@@ -7,384 +7,284 @@ import "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 
 /**
  * @title GaslessPollContract
- * @dev A smart contract for gasless polling using EIP-712 signatures
- * Users sign vote messages off-chain, which are then batched and submitted on-chain
+ * @dev A gasless polling system where users sign votes off-chain and votes are automatically batched on-chain
+ * Key Features:
+ * - Users only interact with a single submitVote() function
+ * - Automatic batching when threshold is reached (no manual batch management)
+ * - Real-time vote counting with efficient storage
+ * - EIP-712 signature verification for security
+ * - Gas optimization through batch processing
  */
 contract GaslessPollContract is Ownable, EIP712 {
     using ECDSA for bytes32;
 
-    // EIP-712 type hash for vote signatures
-    bytes32 public constant VOTE_TYPEHASH =
-        keccak256("Vote(uint256 pollId,uint256 optionIndex,address voter,uint256 nonce)");
+    // Type hash for EIP-712 vote signature
+    bytes32 private constant VOTE_TYPEHASH =
+        keccak256("Vote(uint256 pollId,uint256 optionId,address voter,uint256 nonce)");
 
     // Poll structure
     struct Poll {
         string question;
         string[] options;
-        address creator;
-        uint256 endTime;
-        bool active;
+        uint256[] voteCounts;
+        bool isActive;
+        uint256 createdAt;
+        address creator; // Track who created the poll
+        uint256 duration; // Poll duration in seconds
     }
 
-    // Vote structure for batch processing
-    struct Vote {
+    // Vote structure for pending votes
+    struct PendingVote {
         uint256 pollId;
-        uint256 optionIndex;
+        uint256 optionId;
         address voter;
         uint256 nonce;
+        bytes signature;
     }
 
     // State variables
     mapping(uint256 => Poll) public polls;
-    mapping(uint256 => mapping(uint256 => uint256)) public voteCounts; // pollId => optionIndex => count
-    mapping(uint256 => mapping(address => bool)) public hasVoted; // pollId => voter => hasVoted
-    mapping(address => uint256) public nonces; // voter nonces for replay protection
-
-    // Batch submission tracking
-    mapping(uint256 => Vote[]) public pendingVotes; // pollId => pending votes array
-    mapping(uint256 => bytes[]) public pendingSignatures; // pollId => pending signatures array
-    mapping(uint256 => bool) public batchProcessed; // pollId => whether final batch was processed
+    mapping(uint256 => mapping(address => bool)) public hasVoted;
+    mapping(address => uint256) public voterNonces;
 
     uint256 public pollCount;
+    PendingVote[] public pendingVotes;
 
-    // Batch submission settings
-    uint256 public minBatchSize = 10; // Minimum votes to trigger early batch submission
-    uint256 public maxBatchSize = 100; // Maximum votes per batch transaction
+    // Configuration
+    uint256 public autoBatchThreshold = 5; // Auto-process when this many votes are pending
+    uint256 public maxBatchSize = 50; // Maximum votes to process in one batch
 
     // Events
-    event PollCreated(uint256 indexed pollId, string question, address indexed creator, uint256 endTime);
+    event PollCreated(uint256 indexed pollId, string question, string[] options, address indexed creator);
+    event VoteQueued(uint256 indexed pollId, address indexed voter, uint256 optionId);
+    event VotesProcessed(uint256 indexed pollId, uint256 votesProcessed);
+    event PollClosed(uint256 indexed pollId);
 
-    event VoteCast(uint256 indexed pollId, uint256 optionIndex, address indexed voter);
-
-    event VotesBatched(uint256 indexed pollId, uint256 totalVotes);
-
-    event PollEnded(uint256 indexed pollId);
-
-    event VoteQueued(uint256 indexed pollId, address indexed voter, uint256 optionIndex);
-
-    event BatchTriggered(uint256 indexed pollId, uint256 batchSize, string reason);
-
-    // Custom errors
-    error PollNotActive();
-    error PollExpired();
-    error InvalidOption();
-    error AlreadyVoted();
-    error InvalidSignature();
-    error InvalidNonce();
-    error UnauthorizedEndPoll();
-    error InvalidPollDuration();
-    error InsufficientOptions();
-    error TooManyOptions();
-    error BatchMismatch();
-    error EmptyBatch();
-    error BatchAlreadyProcessed();
-    error PollStillActive();
-    error BatchSizeExceeded();
-
-    constructor(address _owner) Ownable(_owner) EIP712("GaslessPoll", "1") {}
+    constructor() EIP712("GaslessPollContract", "1") Ownable(msg.sender) {}
 
     /**
-     * @dev Create a new poll
-     * @param _question The poll question
-     * @param _options Array of poll options
-     * @param _duration Duration of the poll in seconds
-     * @return The ID of the created poll
+     * @dev Create a new poll with given question, options, and duration
      */
     function createPoll(string memory _question, string[] memory _options, uint256 _duration)
         external
         returns (uint256)
     {
-        if (_options.length < 2) revert InsufficientOptions();
-        if (_options.length > 10) revert TooManyOptions();
-        if (_duration == 0) revert InvalidPollDuration();
+        require(bytes(_question).length > 0, "Question cannot be empty");
+        require(_options.length >= 2, "Must have at least 2 options");
+        require(_options.length <= 10, "Cannot have more than 10 options");
+        require(_duration >= 15 minutes, "Duration must be at least 15 minutes");
+        require(_duration <= 30 days, "Duration cannot exceed 30 days");
 
         uint256 pollId = pollCount++;
 
-        Poll storage poll = polls[pollId];
-        poll.question = _question;
-        poll.options = _options;
-        poll.creator = msg.sender;
-        poll.endTime = block.timestamp + _duration;
-        poll.active = true;
+        // Initialize vote counts array
+        uint256[] memory voteCounts = new uint256[](_options.length);
 
-        emit PollCreated(pollId, _question, msg.sender, poll.endTime);
+        polls[pollId] = Poll({
+            question: _question,
+            options: _options,
+            voteCounts: voteCounts,
+            isActive: true,
+            createdAt: block.timestamp,
+            creator: msg.sender,
+            duration: _duration
+        });
 
+        emit PollCreated(pollId, _question, _options, msg.sender);
         return pollId;
     }
 
     /**
-     * @dev Submit a vote signature to be batched (gasless for users)
-     * @param vote The vote data
-     * @param signature The EIP-712 signature
+     * @dev Single entry point for voting - handles verification and automatic processing
+     * This is the ONLY function users need to interact with
      */
-    function queueVote(Vote calldata vote, bytes calldata signature) external {
-        Poll storage poll = polls[vote.pollId];
+    function submitVote(uint256 _pollId, uint256 _optionId, address _voter, uint256 _nonce, bytes memory _signature)
+        external
+    {
+        require(_pollId < pollCount, "Poll does not exist");
+        require(polls[_pollId].isActive, "Poll is not active");
+        require(_optionId < polls[_pollId].options.length, "Invalid option");
+        require(!hasVoted[_pollId][_voter], "Voter has already voted");
+        require(_nonce == voterNonces[_voter], "Invalid nonce");
+        require(polls[_pollId].creator != _voter, "Poll creators cannot vote on their own polls");
 
-        // Validate poll state
-        if (!poll.active) revert PollNotActive();
-        if (block.timestamp > poll.endTime) revert PollExpired();
-        if (vote.optionIndex >= poll.options.length) revert InvalidOption();
-        if (hasVoted[vote.pollId][vote.voter]) revert AlreadyVoted();
-        if (nonces[vote.voter] != vote.nonce) revert InvalidNonce();
+        // Check if poll has expired
+        require(block.timestamp <= polls[_pollId].createdAt + polls[_pollId].duration, "Poll has expired");
 
-        // Verify EIP-712 signature (but don't process vote yet)
-        bytes32 structHash = keccak256(abi.encode(VOTE_TYPEHASH, vote.pollId, vote.optionIndex, vote.voter, vote.nonce));
+        // Verify the signature
+        bytes32 structHash = keccak256(abi.encode(VOTE_TYPEHASH, _pollId, _optionId, _voter, _nonce));
         bytes32 hash = _hashTypedDataV4(structHash);
-        address signer = hash.recover(signature);
+        address signer = hash.recover(_signature);
+        require(signer == _voter, "Invalid signature");
 
-        if (signer != vote.voter) revert InvalidSignature();
+        // Add to pending votes
+        pendingVotes.push(
+            PendingVote({pollId: _pollId, optionId: _optionId, voter: _voter, nonce: _nonce, signature: _signature})
+        );
 
-        // Queue the vote
-        pendingVotes[vote.pollId].push(vote);
-        pendingSignatures[vote.pollId].push(signature);
+        emit VoteQueued(_pollId, _voter, _optionId);
 
-        // Mark as voted to prevent double voting
-        hasVoted[vote.pollId][vote.voter] = true;
-        nonces[vote.voter]++;
+        // Try automatic processing
+        _tryAutoProcess();
+    }
 
-        emit VoteQueued(vote.pollId, vote.voter, vote.optionIndex);
-
-        // Check if we should trigger early batch submission
-        if (pendingVotes[vote.pollId].length >= minBatchSize) {
-            _processPendingBatch(vote.pollId, "MinBatchSizeReached");
+    /**
+     * @dev Automatically process pending votes if threshold is reached
+     */
+    function _tryAutoProcess() internal {
+        if (pendingVotes.length >= autoBatchThreshold) {
+            _processPendingVotes();
         }
     }
 
     /**
-     * @dev Process final batch when poll ends (can be called by anyone after poll expires)
-     * @param pollId The ID of the poll
+     * @dev Process all pending votes and update on-chain state
      */
-    function processFinalBatch(uint256 pollId) external {
-        Poll storage poll = polls[pollId];
+    function _processPendingVotes() internal {
+        uint256 totalPending = pendingVotes.length;
+        if (totalPending == 0) return;
 
-        if (poll.active && block.timestamp <= poll.endTime) revert PollStillActive();
-        if (batchProcessed[pollId]) revert BatchAlreadyProcessed();
+        uint256 processCount = totalPending > maxBatchSize ? maxBatchSize : totalPending;
+        uint256 votesProcessed = 0;
 
-        _processPendingBatch(pollId, "PollEnded");
-        batchProcessed[pollId] = true;
+        // Process votes from the beginning of the array
+        for (uint256 i = 0; i < processCount; i++) {
+            PendingVote memory vote = pendingVotes[i];
 
-        // Auto-end poll if still marked as active
-        if (poll.active) {
-            poll.active = false;
-            emit PollEnded(pollId);
+            // Check if poll is still active and not expired
+            bool pollExpired = block.timestamp > polls[vote.pollId].createdAt + polls[vote.pollId].duration;
+
+            // Double-check the vote is still valid (prevent replay attacks and handle expired polls)
+            if (!hasVoted[vote.pollId][vote.voter] && polls[vote.pollId].isActive && !pollExpired) {
+                // Mark as voted and increment vote count
+                hasVoted[vote.pollId][vote.voter] = true;
+                voterNonces[vote.voter]++;
+                polls[vote.pollId].voteCounts[vote.optionId]++;
+                votesProcessed++;
+
+                emit VotesProcessed(vote.pollId, 1);
+            }
+            // If poll expired, we still process the vote to remove it from pending but don't count it
+            else if (pollExpired) {
+                // Increment nonce to prevent replay but don't count the vote
+                voterNonces[vote.voter]++;
+            }
+        }
+
+        // Remove processed votes by shifting remaining votes to the beginning
+        uint256 remaining = totalPending - processCount;
+        if (remaining > 0) {
+            for (uint256 i = 0; i < remaining; i++) {
+                pendingVotes[i] = pendingVotes[processCount + i];
+            }
+        }
+
+        // Adjust array length
+        for (uint256 i = 0; i < processCount; i++) {
+            pendingVotes.pop();
         }
     }
 
     /**
-     * @dev Force process current batch (owner only, for emergencies)
-     * @param pollId The ID of the poll
+     * @dev Manual trigger for processing pending votes (in case automatic processing fails)
      */
-    function forceProcessBatch(uint256 pollId) external onlyOwner {
-        _processPendingBatch(pollId, "ForceProcessed");
+    function processPendingVotes() external {
+        _processPendingVotes();
     }
 
     /**
-     * @dev Internal function to process pending votes batch
-     * @param pollId The ID of the poll
-     * @param reason Reason for batch processing
+     * @dev Check if a poll has expired
      */
-    function _processPendingBatch(uint256 pollId, string memory reason) internal {
-        Vote[] storage votes = pendingVotes[pollId];
-        bytes[] storage signatures = pendingSignatures[pollId];
-
-        if (votes.length == 0) return; // No votes to process
-
-        uint256 batchSize = votes.length;
-        if (batchSize > maxBatchSize) {
-            batchSize = maxBatchSize;
-        }
-
-        // Process votes and update counts
-        for (uint256 i = 0; i < batchSize; i++) {
-            voteCounts[pollId][votes[i].optionIndex]++;
-            emit VoteCast(pollId, votes[i].optionIndex, votes[i].voter);
-        }
-
-        // Remove processed votes from pending arrays
-        for (uint256 i = 0; i < batchSize; i++) {
-            votes[i] = votes[votes.length - 1];
-            signatures[i] = signatures[signatures.length - 1];
-            votes.pop();
-            signatures.pop();
-        }
-
-        emit BatchTriggered(pollId, batchSize, reason);
-        emit VotesBatched(pollId, batchSize);
+    function isPollExpired(uint256 _pollId) public view returns (bool) {
+        require(_pollId < pollCount, "Poll does not exist");
+        return block.timestamp > polls[_pollId].createdAt + polls[_pollId].duration;
     }
 
     /**
-     * @dev Submit a batch of votes with their signatures (original method, still available)
-     * @param votes Array of vote data
-     * @param signatures Array of corresponding signatures
+     * @dev Get poll end time
      */
-    function submitVoteBatch(Vote[] calldata votes, bytes[] calldata signatures) external {
-        if (votes.length != signatures.length) revert BatchMismatch();
-        if (votes.length == 0) revert EmptyBatch();
-
-        for (uint256 i = 0; i < votes.length; i++) {
-            _processVote(votes[i], signatures[i]);
-        }
-
-        // Emit batch event for the first poll (assuming all votes are for the same poll)
-        if (votes.length > 0) {
-            emit VotesBatched(votes[0].pollId, votes.length);
-        }
+    function getPollEndTime(uint256 _pollId) external view returns (uint256) {
+        require(_pollId < pollCount, "Poll does not exist");
+        return polls[_pollId].createdAt + polls[_pollId].duration;
     }
 
     /**
-     * @dev Process a single vote with signature verification
-     * @param vote The vote data
-     * @param signature The EIP-712 signature
+     * @dev Get poll details including current vote counts
      */
-    function _processVote(Vote calldata vote, bytes calldata signature) internal {
-        Poll storage poll = polls[vote.pollId];
-
-        // Validate poll state
-        if (!poll.active) revert PollNotActive();
-        if (block.timestamp > poll.endTime) revert PollExpired();
-        if (vote.optionIndex >= poll.options.length) revert InvalidOption();
-        if (hasVoted[vote.pollId][vote.voter]) revert AlreadyVoted();
-        if (nonces[vote.voter] != vote.nonce) revert InvalidNonce();
-
-        // Verify EIP-712 signature
-        bytes32 structHash = keccak256(abi.encode(VOTE_TYPEHASH, vote.pollId, vote.optionIndex, vote.voter, vote.nonce));
-        bytes32 hash = _hashTypedDataV4(structHash);
-        address signer = hash.recover(signature);
-
-        if (signer != vote.voter) revert InvalidSignature();
-
-        // Process the vote
-        hasVoted[vote.pollId][vote.voter] = true;
-        voteCounts[vote.pollId][vote.optionIndex]++;
-        nonces[vote.voter]++;
-
-        emit VoteCast(vote.pollId, vote.optionIndex, vote.voter);
-    }
-
-    /**
-     * @dev End a poll (only creator or owner can end)
-     * @param pollId The ID of the poll to end
-     */
-    function endPoll(uint256 pollId) external {
-        Poll storage poll = polls[pollId];
-
-        if (!poll.active) revert PollNotActive();
-        if (msg.sender != poll.creator && msg.sender != owner()) {
-            revert UnauthorizedEndPoll();
-        }
-
-        poll.active = false;
-        emit PollEnded(pollId);
-    }
-
-    /**
-     * @dev Get poll details
-     * @param pollId The ID of the poll
-     * @return question Poll question
-     * @return options Array of poll options
-     * @return creator Address of poll creator
-     * @return endTime Poll end timestamp
-     * @return active Whether poll is active
-     */
-    function getPoll(uint256 pollId)
+    function getPoll(uint256 _pollId)
         external
         view
-        returns (string memory question, string[] memory options, address creator, uint256 endTime, bool active)
+        returns (
+            string memory question,
+            string[] memory options,
+            uint256[] memory voteCounts,
+            bool isActive,
+            uint256 createdAt,
+            address creator,
+            uint256 duration,
+            uint256 endTime,
+            bool isExpired
+        )
     {
-        Poll storage poll = polls[pollId];
-        return (poll.question, poll.options, poll.creator, poll.endTime, poll.active);
+        require(_pollId < pollCount, "Poll does not exist");
+        Poll memory poll = polls[_pollId];
+        bool expired = isPollExpired(_pollId);
+        uint256 pollEndTime = poll.createdAt + poll.duration;
+
+        return (
+            poll.question,
+            poll.options,
+            poll.voteCounts,
+            poll.isActive && !expired, // Poll is only truly active if not expired
+            poll.createdAt,
+            poll.creator,
+            poll.duration,
+            pollEndTime,
+            expired
+        );
     }
 
     /**
-     * @dev Get vote counts for a poll
-     * @param pollId The ID of the poll
-     * @return Array of vote counts for each option
+     * @dev Get the number of pending votes waiting to be processed
      */
-    function getVoteCounts(uint256 pollId) external view returns (uint256[] memory) {
-        Poll storage poll = polls[pollId];
-        uint256[] memory counts = new uint256[](poll.options.length);
-
-        for (uint256 i = 0; i < poll.options.length; i++) {
-            counts[i] = voteCounts[pollId][i];
-        }
-
-        return counts;
+    function getPendingVotesCount() external view returns (uint256) {
+        return pendingVotes.length;
     }
 
     /**
-     * @dev Check if an address has voted in a poll
-     * @param pollId The ID of the poll
-     * @param voter The address to check
-     * @return Whether the address has voted
+     * @dev Get voter's current nonce for signature creation
      */
-    function hasVotedInPoll(uint256 pollId, address voter) external view returns (bool) {
-        return hasVoted[pollId][voter];
+    function getVoterNonce(address _voter) external view returns (uint256) {
+        return voterNonces[_voter];
     }
 
     /**
-     * @dev Get the current nonce for an address
-     * @param voter The address to get nonce for
-     * @return The current nonce
+     * @dev Check if a voter has voted in a specific poll
      */
-    function getNonce(address voter) external view returns (uint256) {
-        return nonces[voter];
+    function getHasVoted(uint256 _pollId, address _voter) external view returns (bool) {
+        return hasVoted[_pollId][_voter];
     }
 
     /**
-     * @dev Check if a poll is active and not expired
-     * @param pollId The ID of the poll
-     * @return Whether the poll is currently active for voting
+     * @dev Update auto-batch threshold (only owner)
      */
-    function isPollActive(uint256 pollId) external view returns (bool) {
-        Poll storage poll = polls[pollId];
-        return poll.active && block.timestamp <= poll.endTime;
+    function updateAutoBatchThreshold(uint256 _threshold) external onlyOwner {
+        require(_threshold > 0, "Threshold must be greater than 0");
+        autoBatchThreshold = _threshold;
     }
 
     /**
-     * @dev Get total number of polls created
-     * @return The total poll count
+     * @dev Update max batch size (only owner)
      */
-    function getTotalPolls() external view returns (uint256) {
-        return pollCount;
+    function updateMaxBatchSize(uint256 _maxSize) external onlyOwner {
+        require(_maxSize > 0, "Max size must be greater than 0");
+        maxBatchSize = _maxSize;
     }
 
     /**
-     * @dev Get pending votes count for a poll
-     * @param pollId The ID of the poll
-     * @return Number of pending votes
+     * @dev Get the domain separator for EIP-712
      */
-    function getPendingVotesCount(uint256 pollId) external view returns (uint256) {
-        return pendingVotes[pollId].length;
+    function getDomainSeparator() external view returns (bytes32) {
+        return _domainSeparatorV4();
     }
-
-    /**
-     * @dev Get batch settings
-     * @return minBatch Minimum batch size
-     * @return maxBatch Maximum batch size
-     */
-    function getBatchSettings() external view returns (uint256 minBatch, uint256 maxBatch) {
-        return (minBatchSize, maxBatchSize);
-    }
-
-    /**
-     * @dev Set batch settings (owner only)
-     * @param _minBatchSize New minimum batch size
-     * @param _maxBatchSize New maximum batch size
-     */
-    function setBatchSettings(uint256 _minBatchSize, uint256 _maxBatchSize) external onlyOwner {
-        require(_minBatchSize > 0 && _maxBatchSize > _minBatchSize, "Invalid batch sizes");
-        minBatchSize = _minBatchSize;
-        maxBatchSize = _maxBatchSize;
-    }
-
-    /**
-     * @dev Emergency function to pause all polls (owner only)
-     */
-    function emergencyPauseAll() external onlyOwner {
-        // Implementation for emergency pause if needed
-        // This could set a global pause state
-    }
-
-    // Receive function to accept ETH
-    receive() external payable {}
 }
